@@ -43,9 +43,15 @@ concurrency:
 
 env:
   # Python interpreters to build wheels for. Keep in sync with the classifiers
-  # and python_requires in setup.py. Free-threaded (cp3XXt) and PyPI builds are
+  # and python_requires in setup.py. Free-threaded (cp3XXt) and PyPy builds are
   # deliberately excluded: the RIC does not claim support for them yet.
-  CIBW_BUILD_VERSIONS: 'cp310 cp311 cp312 cp313 cp314'
+  #
+  # PROOF OF CONCEPT: cut to one interpreter so a run takes minutes instead of
+  # most of an hour. Every part of the pipeline is still exercised, there is just
+  # one wheel per libc instead of five. Restore the full set before shipping a
+  # real release, otherwise 3.10, 3.11, 3.13 and 3.14 users get no wheel:
+  #   CIBW_BUILD_VERSIONS: 'cp310 cp311 cp312 cp313 cp314'
+  CIBW_BUILD_VERSIONS: 'cp312'
   CIBWHEEL_VERSION: '4.2.1'
 
 jobs:
