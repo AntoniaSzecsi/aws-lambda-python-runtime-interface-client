@@ -190,20 +190,38 @@ jobs:
           archive="dist/awslambdaric-${VERSION}.tar.gz"
           test -f "$archive" || { echo "Expected $archive to exist." >&2; ls -la dist >&2; exit 1; }
           gzip -t "$archive"
+
+          # List once into a file rather than piping tar into each grep. Piping
+          # into "grep -q" is a trap here: grep exits on the first match, tar
+          # keeps writing, takes SIGPIPE, and pipefail then reports the whole
+          # pipeline as failed even though the entry was found.
+          listing="$(mktemp)"
+          tar -tzf "$archive" > "$listing"
+
           # The native extension only compiles at install time if the vendored
           # dependencies and the preinstall script travel inside the sdist.
+          missing=0
           for required in \
             "awslambdaric-${VERSION}/scripts/preinstall.sh" \
             "awslambdaric-${VERSION}/awslambdaric/runtime_client.cpp" \
             "awslambdaric-${VERSION}/deps/versions"; do
-            if ! tar -tzf "$archive" | grep -qx "$required"; then
+            if ! grep -qxF "$required" "$listing"; then
               echo "Missing $required in the sdist." >&2
-              exit 1
+              missing=1
             fi
           done
-          tar -tzf "$archive" | grep -E '^awslambdaric-[^/]+/deps/.*\.tar\.gz$' \
-            || { echo "The sdist carries no vendored dependency tarballs." >&2; exit 1; }
-          echo "sdist looks complete."
+
+          if ! grep -qE '^awslambdaric-[^/]+/deps/.*\.tar\.gz$' "$listing"; then
+            echo "The sdist carries no vendored dependency tarballs." >&2
+            missing=1
+          fi
+
+          if [ "$missing" -ne 0 ]; then
+            echo "--- sdist contents ---" >&2
+            cat "$listing" >&2
+            exit 1
+          fi
+          echo "sdist looks complete ($(wc -l < "$listing" | tr -d ' ') entries)."
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
