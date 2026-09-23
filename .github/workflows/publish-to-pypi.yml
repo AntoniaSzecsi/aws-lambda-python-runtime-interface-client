@@ -425,9 +425,13 @@ jobs:
       # token for a short-lived, project-scoped API token, so there is no
       # long-lived secret to store. attestations produces PEP 740 provenance.
       #
-      # If the upstream release runners turn out to block ghcr.io, replace this
-      # step with a direct POST to ${index}/_/oidc/mint-token followed by twine
-      # upload. That needs no registry egress, only the index itself.
+      # This is a composite action that generates a Docker container action, so
+      # the runner needs a Docker daemon and outbound access to ghcr.io (plus
+      # pkg-containers.githubusercontent.com for the layers) on top of the index
+      # itself. The release runners allowlist both, so nothing else is required
+      # here. The alternative, should that ever change, is to POST directly to
+      # ${index}/_/oidc/mint-token and hand the minted token to twine, which
+      # needs no registry egress.
       - name: Publish
         if: needs.preflight.outputs.upload == 'true'
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
