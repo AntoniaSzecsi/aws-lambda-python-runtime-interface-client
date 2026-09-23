@@ -68,7 +68,10 @@ def read_requirements(req="base.txt"):
 
 
 setup(
-    name="awslambdaric",
+    # POC ONLY: published to a scratch TestPyPI project so the release workflow
+    # can be exercised end to end without touching the real awslambdaric on
+    # PyPI. Revert to name="awslambdaric" before opening a PR upstream.
+    name="awslambdaric-lszecsi",
     version=__version__,
     author="Amazon Web Services",
     description="AWS Lambda Runtime Interface Client for Python",

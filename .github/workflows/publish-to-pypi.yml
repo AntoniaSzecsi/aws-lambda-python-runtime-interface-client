@@ -66,6 +66,7 @@ jobs:
       contents: read
     outputs:
       version: ${{ steps.resolve.outputs.version }}
+      dist_prefix: ${{ steps.resolve.outputs.dist_prefix }}
       ref: ${{ steps.resolve.outputs.ref }}
       target: ${{ steps.resolve.outputs.target }}
       index_base: ${{ steps.resolve.outputs.index_base }}
@@ -114,6 +115,20 @@ jobs:
             exit 1
           fi
 
+          # Read the distribution name rather than assuming it, so that pointing
+          # a fork at a scratch PyPI project only means editing setup.py. PEP 625
+          # normalises the name in filenames: lower case, and any run of "-", "_"
+          # or "." becomes a single "_". So name="awslambdaric-lszecsi" produces
+          # awslambdaric_lszecsi-<version>.tar.gz.
+          dist_name="$(sed -n 's/^[[:space:]]*name="\([^"]*\)".*/\1/p' setup.py | head -1)"
+          if [ -z "$dist_name" ]; then
+            echo "Could not determine the distribution name from setup.py" >&2
+            exit 1
+          fi
+          dist_prefix="$(printf '%s' "$dist_name" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed -E 's/[-_.]+/_/g')"
+
           # release-on-version-change.yml tags bare versions, with no leading "v".
           if [ "$EVENT_NAME" = "release" ]; then
             if [ "$RELEASE_TAG" != "$version" ]; then
@@ -138,6 +153,7 @@ jobs:
 
           {
             echo "version=$version"
+            echo "dist_prefix=$dist_prefix"
             echo "ref=$ref"
             echo "target=$target"
             echo "index_base=$index_base"
@@ -148,6 +164,7 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| field | value |" >> "$GITHUB_STEP_SUMMARY"
           echo "| --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| distribution | \`$dist_name\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| version | \`$version\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| ref | \`$ref\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| index | $index_base |" >> "$GITHUB_STEP_SUMMARY"
@@ -185,9 +202,10 @@ jobs:
       - name: Check the sdist contents
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
+          DIST_PREFIX: ${{ needs.preflight.outputs.dist_prefix }}
         run: |
           set -euo pipefail
-          archive="dist/awslambdaric-${VERSION}.tar.gz"
+          archive="dist/${DIST_PREFIX}-${VERSION}.tar.gz"
           test -f "$archive" || { echo "Expected $archive to exist." >&2; ls -la dist >&2; exit 1; }
           gzip -t "$archive"
 
@@ -202,16 +220,16 @@ jobs:
           # dependencies and the preinstall script travel inside the sdist.
           missing=0
           for required in \
-            "awslambdaric-${VERSION}/scripts/preinstall.sh" \
-            "awslambdaric-${VERSION}/awslambdaric/runtime_client.cpp" \
-            "awslambdaric-${VERSION}/deps/versions"; do
+            "${DIST_PREFIX}-${VERSION}/scripts/preinstall.sh" \
+            "${DIST_PREFIX}-${VERSION}/awslambdaric/runtime_client.cpp" \
+            "${DIST_PREFIX}-${VERSION}/deps/versions"; do
             if ! grep -qxF "$required" "$listing"; then
               echo "Missing $required in the sdist." >&2
               missing=1
             fi
           done
 
-          if ! grep -qE '^awslambdaric-[^/]+/deps/.*\.tar\.gz$' "$listing"; then
+          if ! grep -qE "^${DIST_PREFIX}-[^/]+/deps/.*\.tar\.gz$" "$listing"; then
             echo "The sdist carries no vendored dependency tarballs." >&2
             missing=1
           fi
@@ -373,16 +391,17 @@ jobs:
       - name: Verify the artifacts match the release version
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
+          DIST_PREFIX: ${{ needs.preflight.outputs.dist_prefix }}
         run: |
           set -euo pipefail
           unexpected="$(find dist -type f \( -name '*.whl' -o -name '*.tar.gz' \) \
-            ! -name "awslambdaric-${VERSION}-*" ! -name "awslambdaric-${VERSION}.tar.gz" || true)"
+            ! -name "${DIST_PREFIX}-${VERSION}-*" ! -name "${DIST_PREFIX}-${VERSION}.tar.gz" || true)"
           if [ -n "$unexpected" ]; then
-            echo "Artifacts do not belong to version ${VERSION}:" >&2
+            echo "Artifacts are not ${DIST_PREFIX} ${VERSION}:" >&2
             echo "$unexpected" >&2
             exit 1
           fi
-          echo "All artifacts are for version ${VERSION}."
+          echo "All artifacts are ${DIST_PREFIX} ${VERSION}."
 
       - name: Skip the upload
         if: needs.preflight.outputs.upload != 'true'
