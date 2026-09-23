@@ -1,0 +1,432 @@
+name: publish-to-pypi
+
+# Builds the sdist and the platform wheels on CodeBuild-hosted self-hosted
+# runners, then uploads them to PyPI (or TestPyPI) using a PyPI Trusted
+# Publisher. No long-lived tokens and no GPG signatures are involved: PyPI
+# stopped accepting GPG .asc signatures in 2023.
+#
+# Triggers
+#   release: published  -> publishes the release tag to the production index
+#   workflow_dispatch   -> build-only by default; opt in to an upload
+#
+# Required repository variables (Settings -> Secrets and variables -> Actions):
+#   CODEBUILD_PROJECT_X86_64   name of the x86_64 CodeBuild runner project
+# Optional repository variables:
+#   PIP_INDEX_URL              CodeArtifact index for egress-locked runners
+#   CIBW_MANYLINUX_IMAGE_BASE  registry prefix for the manylinux images
+#   CIBW_MUSLLINUX_IMAGE_BASE  registry prefix for the musllinux images
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Tag, branch or SHA to build. Defaults to the triggering ref.'
+        type: string
+        required: false
+      target:
+        description: 'Index to upload to.'
+        type: choice
+        options: [testpypi, pypi]
+        default: testpypi
+      upload:
+        description: 'Upload to the index. Leave unchecked for a build-only dry run.'
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: publish-to-pypi-${{ github.event.release.tag_name || inputs.ref || github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Python interpreters to build wheels for. Keep in sync with the classifiers
+  # and python_requires in setup.py. Free-threaded (cp3XXt) and PyPI builds are
+  # deliberately excluded: the RIC does not claim support for them yet.
+  CIBW_BUILD_VERSIONS: 'cp310 cp311 cp312 cp313 cp314'
+  CIBWHEEL_VERSION: '4.2.1'
+
+jobs:
+  # Runs on a GitHub-hosted runner on purpose: it resolves the version and the
+  # runner project names, and a missing project name has to fail loudly here
+  # rather than leave a CodeBuild job hanging forever on an unmatched label.
+  preflight:
+    name: Resolve version and target
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      ref: ${{ steps.resolve.outputs.ref }}
+      target: ${{ steps.resolve.outputs.target }}
+      index_base: ${{ steps.resolve.outputs.index_base }}
+      upload: ${{ steps.resolve.outputs.upload }}
+    steps:
+      # Add CODEBUILD_PROJECT_AARCH64 here as well once the arm64 runner project
+      # exists. See the aarch64 note on the build-wheels matrix below.
+      - name: Check that the runner projects are configured
+        env:
+          PROJECT_X86_64: ${{ vars.CODEBUILD_PROJECT_X86_64 }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in PROJECT_X86_64; do
+            if [ -z "${!name:-}" ]; then
+              echo "Repository variable CODEBUILD_${name#PROJECT_} is not set." >&2
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Set the CodeBuild runner project names before releasing." >&2
+            exit 1
+          fi
+
+      - name: Check out the ref being built
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.ref || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve version, index and upload decision
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_TARGET: ${{ inputs.target }}
+          INPUT_UPLOAD: ${{ inputs.upload }}
+        run: |
+          set -euo pipefail
+
+          version="$(sed -n 's/^__version__[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' awslambdaric/__init__.py)"
+          if [ -z "$version" ]; then
+            echo "Could not determine __version__ from awslambdaric/__init__.py" >&2
+            exit 1
+          fi
+
+          # release-on-version-change.yml tags bare versions, with no leading "v".
+          if [ "$EVENT_NAME" = "release" ]; then
+            if [ "$RELEASE_TAG" != "$version" ]; then
+              echo "Release tag '$RELEASE_TAG' does not match __version__ '$version'." >&2
+              echo "Bump awslambdaric/__init__.py and re-tag rather than publishing a mismatch." >&2
+              exit 1
+            fi
+            ref="$RELEASE_TAG"
+            target="pypi"
+            upload="true"
+          else
+            ref="${INPUT_REF:-$GITHUB_SHA}"
+            target="$INPUT_TARGET"
+            upload="$INPUT_UPLOAD"
+          fi
+
+          case "$target" in
+            pypi)     index_base="https://pypi.org" ;;
+            testpypi) index_base="https://test.pypi.org" ;;
+            *) echo "Unknown target '$target'." >&2; exit 1 ;;
+          esac
+
+          {
+            echo "version=$version"
+            echo "ref=$ref"
+            echo "target=$target"
+            echo "index_base=$index_base"
+            echo "upload=$upload"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "### Publish plan" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| field | value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| version | \`$version\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ref | \`$ref\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| index | $index_base |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| upload | $upload |" >> "$GITHUB_STEP_SUMMARY"
+
+  build-sdist:
+    name: Build sdist
+    needs: preflight
+    runs-on:
+      - codebuild-${{ vars.CODEBUILD_PROJECT_X86_64 }}-${{ github.run_id }}-${{ github.run_attempt }}
+      # A unique label per job. Without it GitHub can hand a job to the runner
+      # that CodeBuild started for a different job in the same workflow run.
+      - awslambdaric-sdist
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.ref }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Build the source distribution
+        env:
+          PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/sdist-venv
+          /tmp/sdist-venv/bin/pip install --upgrade "setuptools>=60" "wheel>=0.37.0"
+          # BUILD=true keeps setup.py from compiling curl and aws-lambda-cpp:
+          # an sdist carries the vendored sources and compiles at install time.
+          BUILD=true /tmp/sdist-venv/bin/python setup.py sdist --dist-dir dist
+
+      - name: Check the sdist contents
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          archive="dist/awslambdaric-${VERSION}.tar.gz"
+          test -f "$archive" || { echo "Expected $archive to exist." >&2; ls -la dist >&2; exit 1; }
+          gzip -t "$archive"
+          # The native extension only compiles at install time if the vendored
+          # dependencies and the preinstall script travel inside the sdist.
+          for required in \
+            "awslambdaric-${VERSION}/scripts/preinstall.sh" \
+            "awslambdaric-${VERSION}/awslambdaric/runtime_client.cpp" \
+            "awslambdaric-${VERSION}/deps/versions"; do
+            if ! tar -tzf "$archive" | grep -qx "$required"; then
+              echo "Missing $required in the sdist." >&2
+              exit 1
+            fi
+          done
+          tar -tzf "$archive" | grep -E '^awslambdaric-[^/]+/deps/.*\.tar\.gz$' \
+            || { echo "The sdist carries no vendored dependency tarballs." >&2; exit 1; }
+          echo "sdist looks complete."
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  build-wheels:
+    name: Build ${{ matrix.libc }} ${{ matrix.arch }} wheels
+    needs: preflight
+    runs-on:
+      - codebuild-${{ matrix.project }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - awslambdaric-wheels-${{ matrix.libc }}-${{ matrix.arch }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      # Split by libc as well as by architecture. Each wheel recompiles curl and
+      # aws-lambda-cpp from scratch, so one job per (arch, libc) keeps every job
+      # inside a sane CodeBuild timeout and lets them run in parallel.
+      #
+      # aarch64 is not built yet: wheels have to be compiled on the architecture
+      # they target, and there is only an x86_64 runner project so far. Once an
+      # arm64 runner project exists, set CODEBUILD_PROJECT_AARCH64 and add:
+      #
+      #   - arch: aarch64
+      #     libc: manylinux
+      #     project: ${{ vars.CODEBUILD_PROJECT_AARCH64 }}
+      #   - arch: aarch64
+      #     libc: musllinux
+      #     project: ${{ vars.CODEBUILD_PROJECT_AARCH64 }}
+      #
+      # Until then a release ships the sdist plus x86_64 wheels only, so arm64
+      # consumers compile from the sdist at install time exactly as they do today.
+      matrix:
+        include:
+          - arch: x86_64
+            libc: manylinux
+            project: ${{ vars.CODEBUILD_PROJECT_X86_64 }}
+          - arch: x86_64
+            libc: musllinux
+            project: ${{ vars.CODEBUILD_PROJECT_X86_64 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.ref }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check that a container engine is available
+        run: |
+          set -euo pipefail
+          # cibuildwheel builds Linux wheels inside manylinux/musllinux
+          # containers, so the CodeBuild project must run in privileged mode.
+          docker info >/dev/null 2>&1 || {
+            echo "Docker is not usable on this runner." >&2
+            echo "Enable privileged mode on the CodeBuild project." >&2
+            exit 1
+          }
+          echo "Container engine available."
+
+      - name: Build wheels
+        env:
+          PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
+          CIBW_ARCHS: ${{ matrix.arch }}
+          # Pin manylinux2014 (glibc 2.17) rather than taking the cibuildwheel
+          # default, which has moved on to manylinux_2_28. Lambda still ships an
+          # Amazon Linux 2 base image on glibc 2.26, and a 2_28 wheel would be
+          # rejected there and silently fall back to an sdist compile.
+          CIBW_MANYLINUX_X86_64_IMAGE: ${{ vars.CIBW_MANYLINUX_IMAGE_BASE && format('{0}/manylinux2014_x86_64:latest', vars.CIBW_MANYLINUX_IMAGE_BASE) || 'manylinux2014' }}
+          CIBW_MANYLINUX_AARCH64_IMAGE: ${{ vars.CIBW_MANYLINUX_IMAGE_BASE && format('{0}/manylinux2014_aarch64:latest', vars.CIBW_MANYLINUX_IMAGE_BASE) || 'manylinux2014' }}
+          CIBW_MUSLLINUX_X86_64_IMAGE: ${{ vars.CIBW_MUSLLINUX_IMAGE_BASE && format('{0}/musllinux_1_2_x86_64:latest', vars.CIBW_MUSLLINUX_IMAGE_BASE) || 'musllinux_1_2' }}
+          CIBW_MUSLLINUX_AARCH64_IMAGE: ${{ vars.CIBW_MUSLLINUX_IMAGE_BASE && format('{0}/musllinux_1_2_aarch64:latest', vars.CIBW_MUSLLINUX_IMAGE_BASE) || 'musllinux_1_2' }}
+          # BUILD is deliberately left unset so that setup.py runs
+          # scripts/preinstall.sh inside the container and statically links the
+          # vendored curl and aws-lambda-cpp for that exact platform.
+          CIBW_BEFORE_ALL: ./scripts/ci/cibuildwheel-before-all.sh
+          CIBW_TEST_SOURCES: tests
+          CIBW_TEST_REQUIRES: pytest mock parameterized
+          # Runs against the installed wheel on the target platform, so unlike
+          # the Makefile's test target this can include the tests that need the
+          # compiled extension. The integration suite is excluded: it drives
+          # Docker and the RIE, which Task 2 owns.
+          CIBW_TEST_COMMAND: >-
+            python -c "import runtime_client, awslambdaric; print('awslambdaric', awslambdaric.__version__)"
+            && pytest -q tests --ignore=tests/integration
+          CIBW_BUILD_VERBOSITY: '1'
+        run: |
+          set -euo pipefail
+          # Select the interpreters and the single libc flavour for this job.
+          builds=""
+          for v in $CIBW_BUILD_VERSIONS; do
+            builds="${builds}${builds:+ }${v}-${{ matrix.libc }}_*"
+          done
+          export CIBW_BUILD="$builds"
+          echo "CIBW_BUILD=$CIBW_BUILD"
+
+          python3 -m venv /tmp/cibw-venv
+          /tmp/cibw-venv/bin/pip install --upgrade pip
+          /tmp/cibw-venv/bin/pip install "cibuildwheel==${CIBWHEEL_VERSION}"
+          /tmp/cibw-venv/bin/cibuildwheel --output-dir wheelhouse
+
+      - name: Summarise the wheels
+        run: |
+          set -euo pipefail
+          ls -la wheelhouse
+          count="$(find wheelhouse -name '*.whl' | wc -l | tr -d ' ')"
+          test "$count" -gt 0 || { echo "No wheels were produced." >&2; exit 1; }
+          echo "Built $count wheel(s) for ${{ matrix.libc }} ${{ matrix.arch }}." >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-wheels-${{ matrix.libc }}-${{ matrix.arch }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish to ${{ needs.preflight.outputs.target }}
+    needs: [preflight, build-sdist, build-wheels]
+    runs-on:
+      - codebuild-${{ vars.CODEBUILD_PROJECT_X86_64 }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - awslambdaric-publish
+    timeout-minutes: 30
+    # Gate the upload behind a GitHub environment, named after the target index.
+    # Put required reviewers on "pypi" only, so that a production release needs a
+    # second pair of eyes while TestPyPI iteration stays fast. Whatever name is
+    # used here must also be set on the Trusted Publisher at the index, if the
+    # publisher is configured with an environment.
+    environment: ${{ needs.preflight.outputs.target }}
+    permissions:
+      # Needed to request the OIDC token that PyPI exchanges for an API token.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: List the artifacts to upload
+        run: |
+          set -euo pipefail
+          ls -la dist
+          find dist -name '*.whl' -o -name '*.tar.gz' | sort
+
+      - name: Verify the artifacts match the release version
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          unexpected="$(find dist -type f \( -name '*.whl' -o -name '*.tar.gz' \) \
+            ! -name "awslambdaric-${VERSION}-*" ! -name "awslambdaric-${VERSION}.tar.gz" || true)"
+          if [ -n "$unexpected" ]; then
+            echo "Artifacts do not belong to version ${VERSION}:" >&2
+            echo "$unexpected" >&2
+            exit 1
+          fi
+          echo "All artifacts are for version ${VERSION}."
+
+      - name: Skip the upload
+        if: needs.preflight.outputs.upload != 'true'
+        run: |
+          echo "Dry run: built and validated the artifacts without uploading." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check that a container engine is available
+        if: needs.preflight.outputs.upload == 'true'
+        run: |
+          set -euo pipefail
+          # gh-action-pypi-publish is a composite action that generates a Docker
+          # container action and runs ghcr.io/pypa/gh-action-pypi-publish, so the
+          # CodeBuild project has to run in privileged mode.
+          docker info >/dev/null 2>&1 || {
+            echo "Docker is not usable on this runner." >&2
+            echo "Enable privileged mode on the CodeBuild project." >&2
+            exit 1
+          }
+
+      # Uploads with a PyPI Trusted Publisher: the action swaps the GitHub OIDC
+      # token for a short-lived, project-scoped API token, so there is no
+      # long-lived secret to store. attestations produces PEP 740 provenance.
+      #
+      # If the upstream release runners turn out to block ghcr.io, replace this
+      # step with a direct POST to ${index}/_/oidc/mint-token followed by twine
+      # upload. That needs no registry egress, only the index itself.
+      - name: Publish
+        if: needs.preflight.outputs.upload == 'true'
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist
+          repository-url: ${{ needs.preflight.outputs.index_base }}/legacy/
+          verify-metadata: true
+          attestations: true
+          print-hash: true
+          # TestPyPI gets re-run repeatedly while iterating on this workflow, so
+          # tolerate files that are already there. Production fails loudly
+          # instead of quietly masking a re-release of an existing version.
+          skip-existing: ${{ needs.preflight.outputs.target == 'testpypi' }}
+
+      - name: Record the upload
+        if: needs.preflight.outputs.upload == 'true'
+        env:
+          INDEX_BASE: ${{ needs.preflight.outputs.index_base }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          echo "Uploaded awslambdaric ${VERSION} to ${INDEX_BASE}." >> "$GITHUB_STEP_SUMMARY"
+
+  attach-to-release:
+    name: Attach artifacts to the GitHub Release
+    needs: [preflight, publish]
+    if: github.event_name == 'release'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Upload the artifacts to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" dist/* --clobber
