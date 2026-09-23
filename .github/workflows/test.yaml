@@ -1,0 +1,8 @@
+name: Hello World
+on: [workflow_dispatch]
+jobs:
+  Hello-World-Job:
+    runs-on:
+      - codebuild-test-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - run: echo "Hello World"
