@@ -2,13 +2,8 @@ name: publish-to-pypi
 
 # Builds the sdist and the platform wheels on CodeBuild-hosted self-hosted
 # runners, then uploads them to PyPI (or TestPyPI) using a PyPI Trusted
-# Publisher. No long-lived tokens: the GitHub OIDC token is exchanged for a
-# short-lived, project-scoped API token at upload time.
-#
-# Releases published by this workflow are NOT signed. PyPI dropped PGP in 2023
-# and silently discards .asc signatures, and its replacement, PEP 740
-# attestations, requires signing through Sigstore. That is deliberately out of
-# scope here to keep the runner's network egress to the index alone.
+# Publisher. No long-lived tokens and no GPG signatures are involved: PyPI
+# stopped accepting GPG .asc signatures in 2023.
 #
 # Triggers
 #   release: published  -> publishes the release tag to the production index
@@ -16,15 +11,17 @@ name: publish-to-pypi
 #
 # Required repository variables (Settings -> Secrets and variables -> Actions):
 #   CODEBUILD_PROJECT_X86_64   name of the x86_64 CodeBuild runner project
-# Optional repository variables:
-#   PIP_INDEX_URL              CodeArtifact index for egress-locked runners.
-#                              Make this a secret rather than a variable if the
-#                              URL embeds a CodeArtifact auth token.
-#   CIBW_MANYLINUX_IMAGE_BASE  registry prefix for the manylinux images, e.g.
-#                              <acct>.dkr.ecr.<region>.amazonaws.com/quay/pypa
-#                              for an ECR pull-through cache of quay.io. Leave
-#                              unset to pull from quay.io directly.
-#   CIBW_MUSLLINUX_IMAGE_BASE  same, for the musllinux images
+# Optional repository variables, all for egress-locked runners:
+#   PIP_INDEX_URL   CodeArtifact PyPI proxy. Make this a secret rather than a
+#                   variable if the URL embeds a CodeArtifact auth token.
+#   CIBW_IMAGE_BASE Registry prefix for the manylinux/musllinux build images,
+#                   e.g. <acct>.dkr.ecr.<region>.amazonaws.com/quay/pypa for an
+#                   ECR pull-through cache of quay.io. Unset pulls from quay.
+#   CIBW_IMAGE_TAG  Dated pypa image tag, e.g. 2026.09.05-1. Required whenever
+#                   CIBW_IMAGE_BASE is set.
+#   ECR_REGISTRY    <acct>.dkr.ecr.<region>.amazonaws.com. When set, Docker logs
+#                   in to it before building wheels.
+#   AWS_REGION      Region for the ECR login. Defaults to us-west-2.
 
 on:
   release:
@@ -81,6 +78,7 @@ jobs:
       ref: ${{ steps.resolve.outputs.ref }}
       target: ${{ steps.resolve.outputs.target }}
       index_base: ${{ steps.resolve.outputs.index_base }}
+      upload_url: ${{ steps.resolve.outputs.upload_url }}
       upload: ${{ steps.resolve.outputs.upload }}
     steps:
       # Add CODEBUILD_PROJECT_AARCH64 here as well once the arm64 runner project
@@ -156,9 +154,18 @@ jobs:
             upload="$INPUT_UPLOAD"
           fi
 
+          # index_base is where the OIDC audience and mint-token endpoints live.
+          # upload_url is the separate upload host, which differs for production:
+          # PyPI mints at pypi.org but accepts uploads only at upload.pypi.org.
           case "$target" in
-            pypi)     index_base="https://pypi.org" ;;
-            testpypi) index_base="https://test.pypi.org" ;;
+            pypi)
+              index_base="https://pypi.org"
+              upload_url="https://upload.pypi.org/legacy/"
+              ;;
+            testpypi)
+              index_base="https://test.pypi.org"
+              upload_url="https://test.pypi.org/legacy/"
+              ;;
             *) echo "Unknown target '$target'." >&2; exit 1 ;;
           esac
 
@@ -168,6 +175,7 @@ jobs:
             echo "ref=$ref"
             echo "target=$target"
             echo "index_base=$index_base"
+            echo "upload_url=$upload_url"
             echo "upload=$upload"
           } >> "$GITHUB_OUTPUT"
 
@@ -179,6 +187,7 @@ jobs:
           echo "| version | \`$version\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| ref | \`$ref\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| index | $index_base |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| upload to | $upload_url |" >> "$GITHUB_STEP_SUMMARY"
           echo "| upload | $upload |" >> "$GITHUB_STEP_SUMMARY"
 
   build-sdist:
@@ -317,25 +326,20 @@ jobs:
           }
           echo "Container engine available."
 
-      # cibuildwheel shells out to "docker pull", so the daemon needs registry
-      # credentials in place before it runs. Only relevant when the build images
-      # come from an ECR pull-through cache; quay.io serves them anonymously.
-      - name: Log in to ECR
-        if: vars.CIBW_MANYLINUX_IMAGE_BASE != '' || vars.CIBW_MUSLLINUX_IMAGE_BASE != ''
+      # Only needed when the build images come from an ECR pull-through cache.
+      # cibuildwheel shells out to "docker pull", so the daemon needs ECR
+      # credentials in place before it runs. ECR fetches from quay.io on its own
+      # network, which is why an egress-locked runner never needs quay reachable.
+      - name: Log Docker in to ECR
+        if: vars.ECR_REGISTRY != ''
         env:
-          IMAGE_BASE: ${{ vars.CIBW_MANYLINUX_IMAGE_BASE || vars.CIBW_MUSLLINUX_IMAGE_BASE }}
+          ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}
+          AWS_REGION: ${{ vars.AWS_REGION || 'us-west-2' }}
         run: |
           set -euo pipefail
-          # <account>.dkr.ecr.<region>.amazonaws.com/quay/pypa -> the registry host
-          registry="${IMAGE_BASE%%/*}"
-          region="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
-          if [ -z "$region" ]; then
-            echo "Neither AWS_REGION nor AWS_DEFAULT_REGION is set on the runner." >&2
-            exit 1
-          fi
-          echo "Logging in to ${registry} in ${region}."
-          aws ecr get-login-password --region "$region" \
-            | docker login --username AWS --password-stdin "$registry"
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+          echo "Logged in to $ECR_REGISTRY."
 
       - name: Build wheels
         env:
@@ -354,16 +358,20 @@ jobs:
           # Amazon Linux 2 base image on glibc 2.26, and a 2_28 wheel would be
           # rejected there and silently fall back to an sdist compile.
           #
-          # When mirrored, the tag is pinned to 2026.09.05-1, which is the build
-          # cibuildwheel 4.2.1 pins by digest upstream. That keeps a mirrored
-          # build byte-identical to an unmirrored one, and avoids :latest drifting
-          # under a release pipeline. Bump it alongside CIBWHEEL_VERSION. ECR
-          # pull-through imports by tag, so a digest reference cannot be used here
-          # until the image is already cached.
-          CIBW_MANYLINUX_X86_64_IMAGE: ${{ vars.CIBW_MANYLINUX_IMAGE_BASE && format('{0}/manylinux2014_x86_64:2026.09.05-1', vars.CIBW_MANYLINUX_IMAGE_BASE) || 'manylinux2014' }}
-          CIBW_MANYLINUX_AARCH64_IMAGE: ${{ vars.CIBW_MANYLINUX_IMAGE_BASE && format('{0}/manylinux2014_aarch64:2026.09.05-1', vars.CIBW_MANYLINUX_IMAGE_BASE) || 'manylinux2014' }}
-          CIBW_MUSLLINUX_X86_64_IMAGE: ${{ vars.CIBW_MUSLLINUX_IMAGE_BASE && format('{0}/musllinux_1_2_x86_64:2026.09.05-1', vars.CIBW_MUSLLINUX_IMAGE_BASE) || 'musllinux_1_2' }}
-          CIBW_MUSLLINUX_AARCH64_IMAGE: ${{ vars.CIBW_MUSLLINUX_IMAGE_BASE && format('{0}/musllinux_1_2_aarch64:2026.09.05-1', vars.CIBW_MUSLLINUX_IMAGE_BASE) || 'musllinux_1_2' }}
+          # When CIBW_IMAGE_BASE is set, images are pulled from there instead of
+          # quay.io. Point it at an ECR pull-through cache prefixed for quay, e.g.
+          # <acct>.dkr.ecr.<region>.amazonaws.com/quay/pypa, which keeps the
+          # runner off the public internet entirely.
+          #
+          # CIBW_IMAGE_TAG pins the pypa image build. It is a dated tag rather
+          # than a digest on purpose: a pull-through cache populates itself on
+          # first pull by tag, and pypa does not move a dated tag once published.
+          # Leave it matching the tag cibuildwheel itself pins, so mirrored builds
+          # and direct-from-quay builds use the same image.
+          CIBW_MANYLINUX_X86_64_IMAGE: ${{ vars.CIBW_IMAGE_BASE && format('{0}/manylinux2014_x86_64:{1}', vars.CIBW_IMAGE_BASE, vars.CIBW_IMAGE_TAG) || 'manylinux2014' }}
+          CIBW_MANYLINUX_AARCH64_IMAGE: ${{ vars.CIBW_IMAGE_BASE && format('{0}/manylinux2014_aarch64:{1}', vars.CIBW_IMAGE_BASE, vars.CIBW_IMAGE_TAG) || 'manylinux2014' }}
+          CIBW_MUSLLINUX_X86_64_IMAGE: ${{ vars.CIBW_IMAGE_BASE && format('{0}/musllinux_1_2_x86_64:{1}', vars.CIBW_IMAGE_BASE, vars.CIBW_IMAGE_TAG) || 'musllinux_1_2' }}
+          CIBW_MUSLLINUX_AARCH64_IMAGE: ${{ vars.CIBW_IMAGE_BASE && format('{0}/musllinux_1_2_aarch64:{1}', vars.CIBW_IMAGE_BASE, vars.CIBW_IMAGE_TAG) || 'musllinux_1_2' }}
           # BUILD is deliberately left unset so that setup.py runs
           # scripts/preinstall.sh inside the container and statically links the
           # vendored curl and aws-lambda-cpp for that exact platform.
@@ -431,7 +439,18 @@ jobs:
     permissions:
       # Needed to request the OIDC token that PyPI exchanges for an API token.
       id-token: write
+      contents: read
     steps:
+      # Checked out only for scripts/ci/mint_pypi_token.py. This runs before the
+      # artifacts are downloaded because checkout cleans the workspace.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.ref }}
+          sparse-checkout: scripts/ci
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+          persist-credentials: false
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: dist-*
@@ -476,100 +495,68 @@ jobs:
           python3 -m venv /tmp/twine-venv
           /tmp/twine-venv/bin/pip install --upgrade pip
           /tmp/twine-venv/bin/pip install "twine==${TWINE_VERSION}"
+          /tmp/twine-venv/bin/twine check dist/*
 
-      - name: Check the artifact metadata
-        if: needs.preflight.outputs.upload == 'true'
-        run: /tmp/twine-venv/bin/twine check dist/*
-
-      # Trusted Publisher exchange, done directly rather than through
-      # pypa/gh-action-pypi-publish. The action is a composite that generates a
-      # Docker container action, so it needs a Docker daemon and egress to
-      # ghcr.io; doing the exchange here needs neither, only the index itself.
+      # This is the PyPI Trusted Publisher exchange done by hand, rather than via
+      # pypa/gh-action-pypi-publish. The action is a composite action that
+      # generates a Docker container action and pulls ghcr.io, which an
+      # egress-locked release runner cannot reach. Doing it directly needs no
+      # registry and no container: the only host involved is the index itself.
       #
-      # The trade is PEP 740 attestations, which the action produces and this
-      # does not. Generating them means signing through Sigstore, which reaches
-      # fulcio, rekor, timestamp and tuf-repo-cdn.sigstore.dev. Deliberately
-      # out of scope here: PyPI accepts no other form of signature, since it
-      # dropped PGP in 2023, so releases published this way are unsigned.
-      - name: Mint a PyPI API token from the GitHub OIDC token
+      # The trade-off is that PEP 740 attestations are not produced. The action
+      # generates those by signing with Sigstore, which would require reaching
+      # fulcio.sigstore.dev, rekor.sigstore.dev, timestamp.sigstore.dev and
+      # tuf-repo-cdn.sigstore.dev. None of those are on the release runner
+      # allowlist, and PyPI has not accepted GPG signatures since 2023, so
+      # uploads here are unsigned. Restoring provenance means allowlisting those
+      # four hosts, not swapping in a different signing method.
+      # A failure here is almost always a publisher mismatch rather than a
+      # transport problem: the repository, workflow filename and environment in
+      # the OIDC token all have to match what is configured on the index.
+      - name: Mint a short-lived PyPI token from the GitHub OIDC token
         if: needs.preflight.outputs.upload == 'true'
         id: mint
         env:
-          INDEX_BASE: ${{ needs.preflight.outputs.index_base }}
+          OIDC_BASE: ${{ needs.preflight.outputs.index_base }}
         run: |
           set -euo pipefail
-
-          # Each index advertises the audience it expects in the OIDC token:
-          # "pypi" for PyPI, "testpypi" for TestPyPI.
-          audience="$(curl -sSL --fail "${INDEX_BASE}/_/oidc/audience" \
-            | python3 -c 'import json,sys; print(json.load(sys.stdin)["audience"])')"
-          echo "Requesting a GitHub OIDC token for audience '${audience}'."
-
-          # Available because the job requests id-token: write. Works the same on
-          # a self-hosted runner: the claims describe the workflow, not the host.
-          oidc_token="$(curl -sSL --fail \
-            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${audience}" \
-            | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')"
-          if [ -z "$oidc_token" ]; then
-            echo "GitHub returned no OIDC token. Is id-token: write set?" >&2
-            exit 1
-          fi
-          echo "::add-mask::${oidc_token}"
-
-          # Swap it for a short-lived, project-scoped PyPI token. A 4xx here means
-          # the publisher registered at the index does not match this repository,
-          # workflow filename and environment. Both payloads go through files so
-          # that neither token ever appears in a process argument list.
-          request="$(mktemp)"; response="$(mktemp)"
-          trap 'rm -f "$request" "$response"' EXIT
-          printf '{"token":"%s"}' "$oidc_token" > "$request"
-          curl -sSL -X POST "${INDEX_BASE}/_/oidc/mint-token" \
-            -H 'Content-Type: application/json' \
-            --data-binary "@${request}" > "$response"
-
-          api_token="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("token",""))' "$response")"
-          if [ -z "$api_token" ]; then
-            # A failed exchange returns an error message and never a token, so
-            # echoing the body is safe and is the only way to see the reason.
-            echo "Trusted Publisher exchange failed. Response body:" >&2
-            cat "$response" >&2
-            exit 1
-          fi
+          api_token="$(python3 scripts/ci/mint_pypi_token.py "$OIDC_BASE")"
           echo "::add-mask::${api_token}"
           echo "api_token=${api_token}" >> "$GITHUB_OUTPUT"
-          echo "Minted a project-scoped API token."
 
       - name: Upload to the index
         if: needs.preflight.outputs.upload == 'true'
         env:
-          INDEX_BASE: ${{ needs.preflight.outputs.index_base }}
+          UPLOAD_URL: ${{ needs.preflight.outputs.upload_url }}
           TARGET: ${{ needs.preflight.outputs.target }}
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ steps.mint.outputs.api_token }}
+          TWINE_NON_INTERACTIVE: '1'
         run: |
           set -euo pipefail
           # TestPyPI gets re-run repeatedly while iterating, so tolerate files
           # that are already there. Production fails loudly instead of quietly
           # masking a re-release of an existing version.
-          skip=""
           if [ "$TARGET" = "testpypi" ]; then
-            skip="--skip-existing"
+            set -- --skip-existing
+          else
+            set --
           fi
           /tmp/twine-venv/bin/twine upload \
-            --non-interactive \
+            --repository-url "$UPLOAD_URL" \
             --disable-progress-bar \
-            --repository-url "${INDEX_BASE}/legacy/" \
-            $skip \
+            "$@" \
             dist/*
 
       - name: Record the upload
         if: needs.preflight.outputs.upload == 'true'
         env:
-          INDEX_BASE: ${{ needs.preflight.outputs.index_base }}
+          TARGET: ${{ needs.preflight.outputs.target }}
+          DIST_PREFIX: ${{ needs.preflight.outputs.dist_prefix }}
           VERSION: ${{ needs.preflight.outputs.version }}
         run: |
-          echo "Uploaded awslambdaric ${VERSION} to ${INDEX_BASE}." >> "$GITHUB_STEP_SUMMARY"
+          echo "Uploaded \`${DIST_PREFIX} ${VERSION}\` to ${TARGET} (unsigned: no PEP 740 attestations)." \
+            >> "$GITHUB_STEP_SUMMARY"
 
   attach-to-release:
     name: Attach artifacts to the GitHub Release
