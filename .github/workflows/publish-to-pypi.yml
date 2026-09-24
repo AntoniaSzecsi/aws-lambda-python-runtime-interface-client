@@ -12,7 +12,9 @@ name: publish-to-pypi
 # Required repository variables (Settings -> Secrets and variables -> Actions):
 #   CODEBUILD_PROJECT_X86_64   name of the x86_64 CodeBuild runner project
 # Optional repository variables:
-#   PIP_INDEX_URL              CodeArtifact index for egress-locked runners
+#   PIP_INDEX_URL              CodeArtifact index for egress-locked runners.
+#                              Make this a secret rather than a variable if the
+#                              URL embeds a CodeArtifact auth token.
 #   CIBW_MANYLINUX_IMAGE_BASE  registry prefix for the manylinux images
 #   CIBW_MUSLLINUX_IMAGE_BASE  registry prefix for the musllinux images
 
@@ -193,6 +195,9 @@ jobs:
           PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
         run: |
           set -euo pipefail
+          if [ -n "${PIP_INDEX_URL:-}" ]; then
+            echo "::add-mask::${PIP_INDEX_URL}"
+          fi
           python3 -m venv /tmp/sdist-venv
           /tmp/sdist-venv/bin/pip install --upgrade "setuptools>=60" "wheel>=0.37.0"
           # BUILD=true keeps setup.py from compiling curl and aws-lambda-cpp:
@@ -307,6 +312,14 @@ jobs:
         env:
           PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
           CIBW_ARCHS: ${{ matrix.arch }}
+          # PIP_INDEX_URL on the job only reaches pip on the host. cibuildwheel
+          # builds an explicit environment for the container and injects nothing
+          # but PIP_DISABLE_PIP_VERSION_CHECK and PIP_ROOT_USER_ACTION, so
+          # without this the in-container installs (the build frontend, and the
+          # test requirements below) would bypass the configured index and go
+          # straight to PyPI. An unset value is passed through as empty, which
+          # pip treats as "use the default index".
+          CIBW_ENVIRONMENT_PASS: PIP_INDEX_URL
           # Pin manylinux2014 (glibc 2.17) rather than taking the cibuildwheel
           # default, which has moved on to manylinux_2_28. Lambda still ships an
           # Amazon Linux 2 base image on glibc 2.26, and a 2_28 wheel would be
@@ -331,6 +344,13 @@ jobs:
           CIBW_BUILD_VERBOSITY: '1'
         run: |
           set -euo pipefail
+          # A CodeArtifact index URL carries a bearer token in userinfo, and
+          # cibuildwheel echoes the container environment it builds. This repo is
+          # public, so mask the value before anything can print it.
+          if [ -n "${PIP_INDEX_URL:-}" ]; then
+            echo "::add-mask::${PIP_INDEX_URL}"
+          fi
+
           # Select the interpreters and the single libc flavour for this job.
           builds=""
           for v in $CIBW_BUILD_VERSIONS; do
